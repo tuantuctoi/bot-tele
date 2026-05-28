@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: bot-tele
+    runtime: python
+    buildCommand: "npm --prefix frontend install && npm --prefix frontend run build && pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: VIOTP_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBAPP_URL
+        sync: false

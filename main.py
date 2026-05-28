@@ -1,12 +1,18 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 import time
 import threading
 import logging
 import requests
+from functools import wraps
+from urllib.parse import parse_qsl, unquote
 
-from flask import Flask
-from telegram import Update, BotCommand
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # =========================
@@ -16,6 +22,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 VIOTP_TOKEN = os.getenv("VIOTP_TOKEN")
 ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
 VIOTP_API = "https://api.viotp.com"
 
@@ -34,12 +41,129 @@ RATE_LIMIT_SECONDS = 3
 last_command_time = {}
 
 # Flask app để Render có port web service
-web_app = Flask(__name__)
+_FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+web_app = Flask(__name__, static_folder=_FRONTEND_DIR, static_url_path="/")
+CORS(web_app)
 
 
-@web_app.route("/")
-def home():
-    return "Bot is running"
+# =========================
+# INIT DATA AUTH
+# =========================
+
+def verify_init_data(init_data_raw: str) -> dict | None:
+    """Validate Telegram WebApp initData. Returns parsed user dict or None."""
+    try:
+        params = dict(parse_qsl(init_data_raw, strict_parsing=True))
+        received_hash = params.pop("hash", None)
+        if not received_hash:
+            return None
+
+        data_check_string = "\n".join(
+            f"{k}={v}" for k, v in sorted(params.items())
+        )
+
+        secret_key = hmac.new(
+            b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256
+        ).digest()
+
+        expected_hash = hmac.new(
+            secret_key, data_check_string.encode(), hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected_hash, received_hash):
+            return None
+
+        user_json = params.get("user")
+        return json.loads(unquote(user_json)) if user_json else {}
+
+    except Exception:
+        logging.exception("verify_init_data failed")
+        return None
+
+
+def require_auth(f):
+    """Flask decorator: validate initData header, restrict to ADMIN_IDS."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        init_data_raw = request.headers.get("Authorization", "")
+        user = verify_init_data(init_data_raw)
+
+        if user is None:
+            logging.warning("API auth failed | path=%s", request.path)
+            return jsonify({"success": False, "message": "Unauthorized"}), 401
+
+        user_id = user.get("id")
+        if ADMIN_IDS and user_id not in ADMIN_IDS:
+            logging.warning("API non-admin blocked | user_id=%s", user_id)
+            return jsonify({"success": False, "message": "Forbidden"}), 403
+
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# =========================
+# FLASK API ROUTES
+# =========================
+
+@web_app.route("/api/balance")
+@require_auth
+def api_balance():
+    data = viotp_get("/users/balance")
+    return jsonify(data)
+
+
+@web_app.route("/api/networks")
+@require_auth
+def api_networks():
+    data = viotp_get("/networks/get")
+    return jsonify(data)
+
+
+@web_app.route("/api/services")
+@require_auth
+def api_services():
+    country = request.args.get("country", "vn")
+    data = viotp_get("/service/getv2", {"country": country})
+    return jsonify(data)
+
+
+@web_app.route("/api/buy")
+@require_auth
+def api_buy():
+    params = {"serviceId": request.args.get("serviceId", "")}
+    for key in ("network", "prefix", "exceptPrefix", "number", "country"):
+        val = request.args.get(key)
+        if val:
+            params[key] = val
+    data = viotp_get("/request/getv2", params)
+    return jsonify(data)
+
+
+@web_app.route("/api/code/<request_id>")
+@require_auth
+def api_code(request_id):
+    data = viotp_get("/session/getv2", {"requestId": request_id})
+    return jsonify(data)
+
+
+@web_app.route("/api/history")
+@require_auth
+def api_history():
+    params = {}
+    for key in ("service", "status", "limit", "fromDate", "toDate"):
+        val = request.args.get(key)
+        if val:
+            params[key] = val
+    data = viotp_get("/session/historyv2", params)
+    return jsonify(data)
+
+
+@web_app.route("/", defaults={"path": ""})
+@web_app.route("/<path:path>")
+def serve_frontend(path):
+    if path and os.path.exists(os.path.join(_FRONTEND_DIR, path)):
+        return send_from_directory(_FRONTEND_DIR, path)
+    return send_from_directory(_FRONTEND_DIR, "index.html")
 
 
 def run_web():
@@ -168,20 +292,47 @@ def viotp_get(path: str, params: dict | None = None) -> dict:
 # COMMANDS
 # =========================
 
+async def open_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_command(update, "/app")
+
+    if not await guard(update):
+        return
+
+    if not WEBAPP_URL:
+        await update.message.reply_text("WEBAPP_URL chưa được cấu hình.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Mở VIOTP Mini App", web_app=WebAppInfo(url=WEBAPP_URL))]
+    ])
+    await update.message.reply_text("Bấm nút bên dưới để mở Mini App:", reply_markup=keyboard)
+
+    logging.info("Replied /app button | url=%s", WEBAPP_URL)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_command(update, "/start")
 
     if not await guard(update):
         return
 
-    await update.message.reply_text(
+    text = (
         "Bot VIOTP\n\n"
+        "/app - mở Mini App (giao diện đầy đủ)\n"
         "/balance - kiểm tra số dư\n"
         "/services - danh sách dịch vụ\n"
         "/buy <service_id> - thuê số\n"
         "/code <request_id> - lấy OTP\n"
         "/id - xem Telegram ID"
     )
+
+    if WEBAPP_URL:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Mở Mini App", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ])
+        await update.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text)
 
     logging.info("Replied /start menu")
 
@@ -408,6 +559,7 @@ async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "Hiển thị menu bot"),
+        BotCommand("app", "Mở Mini App"),
         BotCommand("id", "Xem Telegram ID của bạn"),
         BotCommand("balance", "Kiểm tra số dư VIOTP"),
         BotCommand("services", "Xem danh sách dịch vụ"),
@@ -439,6 +591,7 @@ def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("app", open_app))
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("services", services))

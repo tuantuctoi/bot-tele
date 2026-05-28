@@ -1,0 +1,19 @@
+:root {
+  --tg-bg: var(--tg-theme-bg-color, #1c1c1e);
+  --tg-text: var(--tg-theme-text-color, #ffffff);
+  --tg-hint: var(--tg-theme-hint-color, #8e8e93);
+  --tg-link: var(--tg-theme-link-color, #0a84ff);
+  --tg-btn: var(--tg-theme-button-color, #0a84ff);
+  --tg-btn-text: var(--tg-theme-button-text-color, #ffffff);
+  --tg-secondary-bg: var(--tg-theme-secondary-bg-color, #2c2c2e);
+  --radius: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--tg-bg);
+  color: var(--tg-text);
+  min-height: 100vh;
+  font-size: 15px;
+}
+#root { display: flex; flex-direction: column; min-height: 100vh; }
