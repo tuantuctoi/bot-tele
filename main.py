@@ -317,60 +317,88 @@ async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     request_id = context.args[0]
 
-    logging.info("Calling VIOTP code API | request_id=%s", request_id)
+    POLL_INTERVAL = 5       # giây giữa mỗi lần kiểm tra
+    MAX_WAIT = 5 * 60       # tổng thời gian tối đa (5 phút)
+    max_attempts = MAX_WAIT // POLL_INTERVAL
 
-    data = viotp_get("/session/getv2", {
-        "requestId": request_id,
-    })
+    status_msg = await update.message.reply_text(
+        f"Đang chờ OTP cho request `{request_id}`...\n"
+        f"Tự động kiểm tra mỗi {POLL_INTERVAL}s, tối đa {MAX_WAIT // 60} phút.",
+        parse_mode="Markdown",
+    )
 
-    logging.info("Code API result: %s", data)
+    logging.info(
+        "Starting OTP polling | request_id=%s | max_attempts=%s",
+        request_id, max_attempts,
+    )
 
-    if not data.get("success"):
-        await update.message.reply_text(f"Lỗi: {data.get('message')}")
-
-        logging.warning("Code failed | message=%s", data.get("message"))
-        return
-
-    d = data["data"]
-    status = d.get("Status")
-
-    logging.info("OTP status | request_id=%s | status=%s", request_id, status)
-
-    if status == 1:
-        await update.message.reply_text(
-            f"OTP: {d.get('Code')}\n\n"
-            f"SĐT: {d.get('Phone')}\n"
-            f"Dịch vụ: {d.get('ServiceName')}\n\n"
-            f"Nội dung:\n{d.get('SmsContent')}"
-        )
+    for attempt in range(1, max_attempts + 1):
+        await asyncio.sleep(POLL_INTERVAL)
 
         logging.info(
-            "OTP received | request_id=%s | code=%s",
-            request_id,
-            d.get("Code"),
+            "OTP poll attempt %s/%s | request_id=%s",
+            attempt, max_attempts, request_id,
         )
 
-    elif status == 0:
-        await update.message.reply_text(
-            "Đang chờ OTP. Vui lòng thử lại sau 5-10 giây.\n\n"
-            f"/code {request_id}"
+        data = viotp_get("/session/getv2", {"requestId": request_id})
+
+        if not data.get("success"):
+            logging.warning("Code poll error | message=%s", data.get("message"))
+            await status_msg.edit_text(f"Lỗi khi kiểm tra OTP: {data.get('message')}")
+            return
+
+        d = data["data"]
+        status = d.get("Status")
+
+        logging.info(
+            "OTP poll status | request_id=%s | status=%s | attempt=%s",
+            request_id, status, attempt,
         )
 
-        logging.info("OTP pending | request_id=%s", request_id)
+        if status == 1:
+            await status_msg.edit_text(
+                f"OTP: `{d.get('Code')}`\n\n"
+                f"SĐT: {d.get('Phone')}\n"
+                f"Dịch vụ: {d.get('ServiceName')}\n\n"
+                f"Nội dung:\n{d.get('SmsContent')}",
+                parse_mode="Markdown",
+            )
 
-    elif status == 2:
-        await update.message.reply_text("Phiên đã hết hạn.")
+            logging.info(
+                "OTP received | request_id=%s | code=%s | attempt=%s",
+                request_id, d.get("Code"), attempt,
+            )
+            return
 
-        logging.info("OTP expired | request_id=%s", request_id)
+        elif status == 2:
+            await status_msg.edit_text("Phiên đã hết hạn.")
 
-    else:
-        await update.message.reply_text(f"Trạng thái không xác định: {d}")
+            logging.info("OTP expired | request_id=%s", request_id)
+            return
 
-        logging.warning(
-            "Unknown OTP status | request_id=%s | data=%s",
-            request_id,
-            d,
-        )
+        elif status == 0:
+            remaining = (max_attempts - attempt) * POLL_INTERVAL
+            await status_msg.edit_text(
+                f"Đang chờ OTP cho request `{request_id}`...\n"
+                f"Lần kiểm tra: {attempt}/{max_attempts} — còn ~{remaining}s",
+                parse_mode="Markdown",
+            )
+
+        else:
+            await status_msg.edit_text(f"Trạng thái không xác định: {d}")
+
+            logging.warning(
+                "Unknown OTP status | request_id=%s | data=%s",
+                request_id, d,
+            )
+            return
+
+    await status_msg.edit_text(
+        f"Hết thời gian chờ OTP ({MAX_WAIT // 60} phút) cho request `{request_id}`.",
+        parse_mode="Markdown",
+    )
+
+    logging.warning("OTP polling timeout | request_id=%s", request_id)
 
 
 # =========================
