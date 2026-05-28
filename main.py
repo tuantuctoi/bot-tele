@@ -6,7 +6,7 @@ import logging
 import requests
 
 from flask import Flask
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # =========================
@@ -374,6 +374,23 @@ async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
+# BOT SETUP
+# =========================
+
+async def post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Hiển thị menu bot"),
+        BotCommand("id", "Xem Telegram ID của bạn"),
+        BotCommand("balance", "Kiểm tra số dư VIOTP"),
+        BotCommand("services", "Xem danh sách dịch vụ"),
+        BotCommand("buy", "Thuê số: /buy <service_id>"),
+        BotCommand("code", "Lấy OTP: /code <request_id>"),
+    ])
+
+    logging.info("Bot commands have been set")
+
+
+# =========================
 # BOT RUNNER
 # =========================
 
@@ -391,7 +408,7 @@ def run_bot():
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS đang trống. Không ai ngoài lệnh /id dùng được bot.")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", my_id))
