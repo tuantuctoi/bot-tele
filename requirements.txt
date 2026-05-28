@@ -1,3 +1,4 @@
 python-telegram-bot==21.6
 requests==2.32.3
-Flask==3.0.3flask-cors==4.0.1
+Flask==3.0.3
+flask-cors==4.0.1
