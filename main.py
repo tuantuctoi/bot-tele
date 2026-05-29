@@ -11,11 +11,12 @@ from contextlib import contextmanager
 from flask import Flask
 from telegram import (
     Update, BotCommand, BotCommandScopeDefault,
-    BotCommandScopeAllGroupChats, ChatMember,
+    BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats,
+    ChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
 )
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ChatMemberHandler, ContextTypes, filters,
+    ApplicationBuilder, CallbackQueryHandler, CommandHandler,
+    MessageHandler, ChatMemberHandler, ContextTypes, filters,
 )
 
 # =========================
@@ -97,6 +98,12 @@ def init_db():
                 active       INTEGER DEFAULT 1
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                chat_id INTEGER PRIMARY KEY,
+                title   TEXT    DEFAULT ''
+            )
+        """)
 
 
 def upsert_member(chat_id, user_id, username="", full_name="",
@@ -138,6 +145,21 @@ def get_top(chat_id, by="points", limit=10):
         return conn.execute(
             f"SELECT * FROM members WHERE chat_id = ? ORDER BY {by} DESC LIMIT ?",
             (chat_id, limit)
+        ).fetchall()
+
+
+def upsert_group(chat_id, title=""):
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO groups (chat_id, title) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
+        """, (chat_id, title or ""))
+
+
+def get_groups():
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM groups ORDER BY title"
         ).fetchall()
 
 
@@ -249,8 +271,9 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     u = new.user
 
     if u.is_bot:
-        # Bot itself was added to a group — seed admins
+        # Bot itself was added to a group — track group and seed admins
         if new.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+            upsert_group(chat.id, chat.title or "")
             await seed_members_from_api(context.bot, chat.id)
         return
 
@@ -268,6 +291,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert_member(chat.id, user.id, user.username or "", user.full_name)
     # Auto-seed admins when /start is called in a group
     if only_group(chat):
+        upsert_group(chat.id, chat.title or "")
         await seed_members_from_api(context.bot, chat.id)
     await update.message.reply_text(
         "🤖 *Bot Nhóm*\n\n"
@@ -575,15 +599,247 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
+# ADMIN PANEL
+# =========================
+
+def admin_menu_markup():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Nhóm của bot",      callback_data="adm:groups"),
+            InlineKeyboardButton("📢 Thông báo",          callback_data="adm:announce"),
+        ],
+        [
+            InlineKeyboardButton("➕ Thêm thành viên",    callback_data="adm:add_member"),
+            InlineKeyboardButton("🏆 Xếp hạng",           callback_data="adm:top"),
+        ],
+        [
+            InlineKeyboardButton("📊 Thống kê",           callback_data="adm:stats"),
+            InlineKeyboardButton("🔄 Reset điểm",         callback_data="adm:reset"),
+        ],
+    ])
+
+
+def group_select_markup(action):
+    groups = get_groups()
+    if not groups:
+        return None
+    buttons = [
+        [InlineKeyboardButton(
+            f"💬 {g['title'] or str(g['chat_id'])}",
+            callback_data=f"grp:{action}:{g['chat_id']}"
+        )]
+        for g in groups
+    ]
+    buttons.append([InlineKeyboardButton("↩ Quay lại", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if chat.type != "private":
+        await update.message.reply_text("⚠️ Dùng /admin trong chat riêng với bot.")
+        return
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Bạn không có quyền admin.")
+        return
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🔧 *Admin Panel*\n\nChọn chức năng:",
+        parse_mode="Markdown",
+        reply_markup=admin_menu_markup(),
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    context.user_data.clear()
+    await update.message.reply_text("❌ Đã huỷ.", reply_markup=admin_menu_markup())
+
+
+async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for multi-step admin actions in private chat."""
+    user = update.effective_user
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        return
+    action = context.user_data.get("admin_action")
+    if not action:
+        return
+
+    text = update.message.text.strip()
+
+    if action == "announce":
+        group_id    = context.user_data["admin_group_id"]
+        group_title = context.user_data["admin_group_title"]
+        context.user_data.clear()
+        try:
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=f"📢 *Thông báo từ Admin:*\n\n{text}",
+                parse_mode="Markdown",
+            )
+            await update.message.reply_text(
+                f"✅ Đã gửi thông báo đến *{group_title}*",
+                parse_mode="Markdown",
+                reply_markup=admin_menu_markup(),
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Lỗi: {e}", reply_markup=admin_menu_markup())
+
+    elif action == "add_member":
+        group_id    = context.user_data["admin_group_id"]
+        group_title = context.user_data["admin_group_title"]
+        parts = text.split(None, 2)
+        if not parts or not parts[0].lstrip("-").isdigit():
+            await update.message.reply_text("⚠️ Telegram ID phải là số. Thử lại hoặc /cancel:")
+            return
+        uid       = int(parts[0])
+        full_name = parts[1] if len(parts) > 1 else "Unknown"
+        username  = parts[2].lstrip("@") if len(parts) > 2 else ""
+        context.user_data.clear()
+        upsert_member(group_id, uid, username, full_name)
+        await update.message.reply_text(
+            f"✅ Đã thêm *{full_name}* (`{uid}`) vào nhóm *{group_title}*",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_markup(),
+        )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        await query.answer("❌ Không có quyền.", show_alert=True)
+        return
+
+    data = query.data
+    back_btn = InlineKeyboardButton("↩ Quay lại", callback_data="adm:menu")
+
+    if data == "adm:menu":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "🔧 *Admin Panel*\n\nChọn chức năng:",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_markup(),
+        )
+
+    elif data == "adm:groups":
+        groups = get_groups()
+        if not groups:
+            text = "Chưa có nhóm nào. Thêm bot vào nhóm để bắt đầu."
+        else:
+            text = "📋 *Nhóm của bot:*\n\n"
+            for g in groups:
+                cnt = len(get_members(g["chat_id"]))
+                text += f"💬 *{g['title'] or '(không tên)'}*\n"
+                text += f"   ID: `{g['chat_id']}` — {cnt} thành viên\n"
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[back_btn]])
+        )
+
+    elif data in ("adm:announce", "adm:add_member", "adm:top", "adm:stats", "adm:reset"):
+        action  = data.split(":")[1]
+        markup  = group_select_markup(action)
+        labels  = {
+            "announce":   "📢 Chọn nhóm để gửi thông báo:",
+            "add_member": "➕ Chọn nhóm để thêm thành viên:",
+            "top":        "🏆 Chọn nhóm để xem xếp hạng:",
+            "stats":      "📊 Chọn nhóm để xem thống kê:",
+            "reset":      "🔄 Chọn nhóm để reset điểm:",
+        }
+        if not markup:
+            await query.edit_message_text(
+                "Chưa có nhóm nào.",
+                reply_markup=InlineKeyboardMarkup([[back_btn]])
+            )
+            return
+        await query.edit_message_text(labels[action], reply_markup=markup)
+
+    elif data.startswith("grp:"):
+        _, action, chat_id_str = data.split(":", 2)
+        chat_id = int(chat_id_str)
+        with get_db() as conn:
+            g = conn.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,)).fetchone()
+        title = g["title"] if g else str(chat_id)
+
+        if action in ("top", "stats"):
+            by    = "points" if action == "top" else "msg_count"
+            label = "🏆 Top điểm" if action == "top" else "📊 Thống kê"
+            unit  = "điểm"        if action == "top" else "tin"
+            rows  = get_top(chat_id, by=by, limit=10)
+            text  = f"{label} — *{title}*\n\n"
+            if not rows:
+                text += "Chưa có dữ liệu."
+            for i, row in enumerate(rows):
+                medal = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
+                text += f"{medal} {fmt_name(row)} — {row[by]} {unit}\n"
+            await query.edit_message_text(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩ Quay lại", callback_data=f"adm:{action}"),
+                    InlineKeyboardButton("🏠 Menu",     callback_data="adm:menu"),
+                ]])
+            )
+
+        elif action == "announce":
+            context.user_data["admin_action"]      = "announce"
+            context.user_data["admin_group_id"]    = chat_id
+            context.user_data["admin_group_title"] = title
+            await query.edit_message_text(
+                f"📢 Gửi thông báo đến *{title}*\n\nNhập nội dung (gửi /cancel để huỷ):",
+                parse_mode="Markdown",
+            )
+
+        elif action == "add_member":
+            context.user_data["admin_action"]      = "add_member"
+            context.user_data["admin_group_id"]    = chat_id
+            context.user_data["admin_group_title"] = title
+            await query.edit_message_text(
+                f"➕ Thêm thành viên vào *{title}*\n\n"
+                f"Nhập theo định dạng:\n"
+                f"`<telegram_id> <tên> <username hoặc bỏ trống>`\n\n"
+                f"Ví dụ: `123456789 Nguyen Van A vanA`\n\n"
+                f"Gửi /cancel để huỷ.",
+                parse_mode="Markdown",
+            )
+
+        elif action == "reset":
+            await query.edit_message_text(
+                f"🔄 Xác nhận reset *toàn bộ điểm* của nhóm *{title}*?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Xác nhận", callback_data=f"confirm:reset:{chat_id}"),
+                    InlineKeyboardButton("❌ Huỷ",      callback_data="adm:menu"),
+                ]])
+            )
+
+    elif data.startswith("confirm:reset:"):
+        chat_id = int(data.split(":")[2])
+        with get_db() as conn:
+            conn.execute("UPDATE members SET points = 0 WHERE chat_id = ?", (chat_id,))
+            g = conn.execute("SELECT title FROM groups WHERE chat_id = ?", (chat_id,)).fetchone()
+        title = g["title"] if g else str(chat_id)
+        context.user_data.clear()
+        await query.edit_message_text(
+            f"✅ Đã reset toàn bộ điểm của nhóm *{title}*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="adm:menu")]])
+        )
+
+
+# =========================
 # BOT SETUP
 # =========================
 
 async def post_init(app):
-    commands = [
+    group_commands = [
         BotCommand("start",     "Hiển thị menu"),
         BotCommand("random",    "Chọn ngẫu nhiên thành viên"),
         BotCommand("roll",      "Tung xúc xắc: /roll [max]"),
-        BotCommand("guess",     "Bắt đầu đoán số"),
+        BotCommand("guess",     "Bắt đầu đoán số (admin)"),
         BotCommand("stopguess", "Dừng đoán số"),
         BotCommand("raffle",    "Tạo bốc thăm: /raffle <giải>"),
         BotCommand("join",      "Tham gia bốc thăm"),
@@ -593,11 +849,14 @@ async def post_init(app):
         BotCommand("points",    "Xem điểm của bạn"),
         BotCommand("gift",      "Tặng điểm: /gift @user <điểm>"),
     ]
-    # Default scope (private chat)
-    await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-    # Group scope — shows autocomplete when typing / in groups
-    await app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
-    logging.info("Bot commands registered for default + group scopes")
+    private_commands = group_commands + [
+        BotCommand("admin",  "Admin panel (chỉ admin)"),
+        BotCommand("cancel", "Huỷ thao tác hiện tại"),
+    ]
+    await app.bot.set_my_commands(private_commands, scope=BotCommandScopeDefault())
+    await app.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+    await app.bot.set_my_commands(group_commands,   scope=BotCommandScopeAllGroupChats())
+    logging.info("Bot commands registered for all scopes")
 
 
 # =========================
@@ -618,6 +877,15 @@ def run_bot():
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Admin panel (private)
+    app.add_handler(CommandHandler("admin",  cmd_admin))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_admin_message,
+    ))
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("random",    cmd_random))
