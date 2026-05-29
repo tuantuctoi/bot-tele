@@ -969,7 +969,7 @@ def run_bot():
     logging.info("Bot started with polling...")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "chat_member", "my_chat_member"],
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
     )
 
 
