@@ -299,7 +299,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if only_group(chat):
         upsert_group(chat.id, chat.title or "")
         await seed_members_from_api(context.bot, chat.id)
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "🤖 *Bot Nhóm*\n\n"
         "📋 Danh sách lệnh:\n"
         "🎲 /random — chọn ngẫu nhiên thành viên\n"
@@ -314,7 +314,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 /points — xem điểm của bạn\n"
         "🎁 /gift @user <điểm> — tặng điểm",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Đóng", callback_data="dismiss:menu")
+        ]]),
     )
+    asyncio.create_task(_auto_delete(sent, delay=30))
+    asyncio.create_task(_auto_delete(update.message, delay=30))
 
 
 async def cmd_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,13 +505,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     top = get_top(chat.id, by="msg_count", limit=10)
     if not top:
-        await update.message.reply_text("Chưa có dữ liệu thống kê.")
+        await reply_and_delete(update.message, "Chưa có dữ liệu thống kê.", delay=10)
         return
     text = "📊 *Thống kê tin nhắn (Top 10)*\n\n"
     for i, row in enumerate(top):
         medal = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
         text += f"{medal} {fmt_name(row)} — {row['msg_count']} tin\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    sent = await update.message.reply_text(text, parse_mode="Markdown")
+    asyncio.create_task(_auto_delete(sent, delay=10))
+    asyncio.create_task(_auto_delete(update.message, delay=10))
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,13 +523,15 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     top = get_top(chat.id, by="points", limit=10)
     if not top:
-        await update.message.reply_text("Chưa có dữ liệu xếp hạng.")
+        await reply_and_delete(update.message, "Chưa có dữ liệu xếp hạng.", delay=10)
         return
     text = "🏆 *Bảng xếp hạng điểm*\n\n"
     for i, row in enumerate(top):
         medal = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
         text += f"{medal} {fmt_name(row)} — {row['points']} điểm\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    sent = await update.message.reply_text(text, parse_mode="Markdown")
+    asyncio.create_task(_auto_delete(sent, delay=10))
+    asyncio.create_task(_auto_delete(update.message, delay=10))
 
 
 async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,11 +761,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
+    data = query.data
+
+    # dismiss:menu — anyone can close the /start menu
+    if data == "dismiss:menu":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
     if ADMIN_IDS and user.id not in ADMIN_IDS:
         await query.answer("❌ Không có quyền.", show_alert=True)
         return
 
-    data = query.data
     back_btn = InlineKeyboardButton("↩ Quay lại", callback_data="adm:menu")
 
     if data == "adm:menu":
