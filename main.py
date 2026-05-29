@@ -24,6 +24,11 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "/tmp/bot_data.db")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -318,8 +323,12 @@ async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
+    user = update.effective_user
     if not only_group(chat):
         await update.message.reply_text("❌ Lệnh này chỉ dùng trong nhóm.")
+        return
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Chỉ admin mới có thể bắt đầu game đoán số.")
         return
     if chat.id in active_games:
         await update.message.reply_text("⚠️ Đang có game đoán số. Dùng /stopguess để dừng.")
