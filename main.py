@@ -20,7 +20,7 @@ from telegram.ext import (
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/bot_data.db")
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
