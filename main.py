@@ -212,12 +212,17 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text.isdigit():
         return
 
+    # Track this guess message for cleanup on game end
+    game.setdefault("messages", []).append(update.message.message_id)
+
     guess = int(text)
     game["attempts"] += 1
     target = game["number"]
 
     if guess == target:
+        msgs_to_delete = list(game.get("messages", []))
         del active_games[chat.id]
+        asyncio.create_task(_delete_messages(context.bot, chat.id, msgs_to_delete))
         upsert_member(chat.id, user.id, user.username or "", user.full_name,
                       add_points=50)
         await update.message.reply_text(
@@ -240,7 +245,8 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temp = "🌡️ Gần rồi!"
         else:
             temp = "❄️ Lạnh!"
-        await update.message.reply_text(f"{direction}\n{temp}", parse_mode="Markdown")
+        hint = await update.message.reply_text(f"{direction}\n{temp}", parse_mode="Markdown")
+        game["messages"].append(hint.message_id)
 
 
 # =========================
@@ -318,7 +324,8 @@ async def cmd_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     members = get_members(chat.id)
     if len(members) < 2:
-        await update.message.reply_text(
+        await reply_and_delete(
+            update.message,
             "⚠️ Chưa đủ thành viên (cần ít nhất 2 người đã nhắn tin trong nhóm)."
         )
         return
@@ -352,36 +359,41 @@ async def cmd_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Lệnh này chỉ dùng trong nhóm.")
         return
     if ADMIN_IDS and user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Chỉ admin mới có thể bắt đầu game đoán số.")
+        await reply_and_delete(update.message, "❌ Chỉ admin mới có thể bắt đầu game đoán số.")
         return
     if chat.id in active_games:
-        await update.message.reply_text("⚠️ Đang có game đoán số. Dùng /stopguess để dừng.")
+        await reply_and_delete(update.message, "⚠️ Đang có game đoán số. Dùng /stopguess để dừng.")
         return
     number = random.randint(1, 100)
     active_games[chat.id] = {
         "number": number,
         "started_by": update.effective_user.id,
         "attempts": 0,
+        "messages": [update.message.message_id],
     }
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "🎯 *Trò chơi đoán số bắt đầu!*\n\n"
         "Mình đang nghĩ một số từ *1 đến 100*\n"
         "Ai đoán đúng trước nhận *+50 điểm!* 🏆\n\n"
         "Hãy gửi một số để đoán 👇",
         parse_mode="Markdown",
     )
+    active_games[chat.id]["messages"].append(sent.message_id)
 
 
 async def cmd_stopguess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     game = active_games.pop(chat.id, None)
     if not game:
-        await update.message.reply_text("Không có game đoán số nào đang diễn ra.")
+        await reply_and_delete(update.message, "Không có game đoán số nào đang diễn ra.")
         return
-    await update.message.reply_text(
+    asyncio.create_task(_delete_messages(context.bot, chat.id, game.get("messages", [])))
+    sent = await update.message.reply_text(
         f"🛑 Game đoán số đã dừng. Đáp án là *{game['number']}*",
         parse_mode="Markdown",
     )
+    asyncio.create_task(_auto_delete(sent, delay=5))
+    asyncio.create_task(_auto_delete(update.message, delay=5))
 
 
 async def cmd_raffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -399,7 +411,7 @@ async def cmd_raffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT 1 FROM raffles WHERE chat_id = ? AND active = 1", (chat.id,)
         ).fetchone()
         if existing:
-            await update.message.reply_text("⚠️ Đang có bốc thăm. Dùng /draw để quay số trước.")
+            await reply_and_delete(update.message, "⚠️ Đang có bốc thăm. Dùng /draw để quay số trước.")
             return
         first = json.dumps([{"id": user.id, "name": user.full_name, "username": user.username or ""}])
         conn.execute(
@@ -424,11 +436,11 @@ async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM raffles WHERE chat_id = ? AND active = 1", (chat.id,)
         ).fetchone()
         if not raffle:
-            await update.message.reply_text("Không có bốc thăm nào đang diễn ra.")
+            await reply_and_delete(update.message, "Không có bốc thăm nào đang diễn ra.")
             return
         participants = json.loads(raffle["participants"])
         if any(p["id"] == user.id for p in participants):
-            await update.message.reply_text(f"✅ {mention(user)} đã tham gia rồi!")
+            await reply_and_delete(update.message, f"✅ {mention(user)} đã tham gia rồi!")
             return
         participants.append({"id": user.id, "name": user.full_name, "username": user.username or ""})
         conn.execute(
@@ -449,21 +461,21 @@ async def cmd_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM raffles WHERE chat_id = ? AND active = 1", (chat.id,)
         ).fetchone()
         if not raffle:
-            await update.message.reply_text("Không có bốc thăm nào đang diễn ra.")
+            await reply_and_delete(update.message, "Không có bốc thăm nào đang diễn ra.")
             return
         # Only creator or group admin can draw
         if raffle["creator_id"] != user.id:
             try:
                 cm = await chat.get_member(user.id)
                 if cm.status not in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
-                    await update.message.reply_text("❌ Chỉ người tạo bốc thăm hoặc admin mới có thể quay số.")
+                    await reply_and_delete(update.message, "❌ Chỉ người tạo bốc thăm hoặc admin mới có thể quay số.")
                     return
             except Exception:
-                await update.message.reply_text("❌ Không thể xác nhận quyền của bạn.")
+                await reply_and_delete(update.message, "❌ Không thể xác nhận quyền của bạn.")
                 return
         participants = json.loads(raffle["participants"])
         if len(participants) < 2:
-            await update.message.reply_text("⚠️ Cần ít nhất 2 người tham gia.")
+            await reply_and_delete(update.message, "⚠️ Cần ít nhất 2 người tham gia.")
             return
         winner = random.choice(participants)
         conn.execute(
@@ -609,6 +621,22 @@ async def _auto_delete(message, delay: int = 5):
         await message.delete()
     except Exception:
         pass
+
+
+async def _delete_messages(bot, chat_id: int, message_ids: list):
+    """Delete a list of messages by ID (best-effort)."""
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+
+async def reply_and_delete(message, text, delay: int = 5, **kwargs):
+    """Reply to a message then auto-delete both the reply and original after delay."""
+    reply = await message.reply_text(text, **kwargs)
+    asyncio.create_task(_auto_delete(reply, delay))
+    asyncio.create_task(_auto_delete(message, delay))
 
 
 # =========================
