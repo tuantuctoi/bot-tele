@@ -599,6 +599,19 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
+# UTILITIES
+# =========================
+
+async def _auto_delete(message, delay: int = 5):
+    """Delete a message after `delay` seconds (best-effort)."""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+# =========================
 # ADMIN PANEL
 # =========================
 
@@ -674,13 +687,14 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         group_title = context.user_data["admin_group_title"]
         context.user_data.clear()
         try:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=group_id,
                 text=f"📢 *Thông báo từ Admin:*\n\n{text}",
                 parse_mode="Markdown",
             )
+            asyncio.create_task(_auto_delete(sent, delay=5))
             await update.message.reply_text(
-                f"✅ Đã gửi thông báo đến *{group_title}*",
+                f"✅ Đã gửi thông báo đến *{group_title}* (tự xóa sau 5 giây)",
                 parse_mode="Markdown",
                 reply_markup=admin_menu_markup(),
             )
