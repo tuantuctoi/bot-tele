@@ -253,17 +253,21 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # COMMANDS
 # =========================
 
-async def seed_members_from_api(bot, chat_id: int):
-    """Fetch admins from Telegram API and seed into DB."""
+async def seed_members_from_api(bot, chat_id: int) -> int:
+    """Fetch admins from Telegram API and seed into DB. Returns count of non-bot admins seeded."""
     try:
         admins = await bot.get_chat_administrators(chat_id)
+        count = 0
         for cm in admins:
             u = cm.user
             if not u.is_bot:
                 upsert_member(chat_id, u.id, u.username or "", u.full_name)
-        logging.info("Seeded %d admins for chat %s", len(admins), chat_id)
+                count += 1
+        logging.info("Seeded %d admins for chat %s", count, chat_id)
+        return count
     except Exception:
         logging.exception("seed_members_from_api failed | chat_id=%s", chat_id)
+        return 0
 
 
 async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -399,6 +403,40 @@ async def cmd_stopguess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     asyncio.create_task(_auto_delete(sent, delay=5))
     asyncio.create_task(_auto_delete(update.message, delay=5))
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: scan/refresh member info for this group."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not only_group(chat):
+        await reply_and_delete(update.message, "❌ Lệnh này chỉ dùng trong nhóm.")
+        return
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        await reply_and_delete(update.message, "❌ Chỉ admin mới có thể quét.")
+        return
+
+    upsert_group(chat.id, chat.title or "")
+    msg = await update.message.reply_text("🔍 Đang quét thành viên...")
+
+    admin_count = await seed_members_from_api(context.bot, chat.id)
+    total = len(get_members(chat.id))
+    try:
+        member_count = await context.bot.get_chat_member_count(chat.id)
+    except Exception:
+        member_count = "?"
+
+    await msg.edit_text(
+        f"✅ *Quét xong!*\n\n"
+        f"👥 Tổng thành viên trong nhóm: *{member_count}*\n"
+        f"💾 Đã lưu trong DB: *{total}*\n"
+        f"🔑 Admin đã cập nhật: *{admin_count}*\n\n"
+        f"⚠️ Telegram chỉ cho phép lấy danh sách admin. "
+        f"Thành viên thường sẽ được ghi nhận dần khi nhắn tin.",
+        parse_mode="Markdown",
+    )
+    asyncio.create_task(_auto_delete(msg, delay=15))
+    asyncio.create_task(_auto_delete(update.message, delay=15))
 
 
 async def cmd_raffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -660,10 +698,13 @@ def admin_menu_markup():
         ],
         [
             InlineKeyboardButton("➕ Thêm thành viên",    callback_data="adm:add_member"),
-            InlineKeyboardButton("🏆 Xếp hạng",           callback_data="adm:top"),
+            InlineKeyboardButton("🔍 Quét thành viên",    callback_data="adm:scan"),
         ],
         [
+            InlineKeyboardButton("🏆 Xếp hạng",           callback_data="adm:top"),
             InlineKeyboardButton("📊 Thống kê",           callback_data="adm:stats"),
+        ],
+        [
             InlineKeyboardButton("🔄 Reset điểm",         callback_data="adm:reset"),
         ],
     ])
@@ -800,12 +841,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[back_btn]])
         )
 
-    elif data in ("adm:announce", "adm:add_member", "adm:top", "adm:stats", "adm:reset"):
+    elif data in ("adm:announce", "adm:add_member", "adm:scan", "adm:top", "adm:stats", "adm:reset"):
         action  = data.split(":")[1]
         markup  = group_select_markup(action)
         labels  = {
             "announce":   "📢 Chọn nhóm để gửi thông báo:",
             "add_member": "➕ Chọn nhóm để thêm thành viên:",
+            "scan":       "🔍 Chọn nhóm để quét thành viên:",
             "top":        "🏆 Chọn nhóm để xem xếp hạng:",
             "stats":      "📊 Chọn nhóm để xem thống kê:",
             "reset":      "🔄 Chọn nhóm để reset điểm:",
@@ -866,6 +908,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
 
+        elif action == "scan":
+            await query.edit_message_text(f"🔍 Đang quét *{title}*...", parse_mode="Markdown")
+            try:
+                chat_obj  = await context.bot.get_chat(chat_id)
+                new_title = chat_obj.title or title
+                upsert_group(chat_id, new_title)
+            except Exception:
+                new_title = title
+
+            # Fetch admins (Telegram API cannot return all members of a supergroup)
+            admin_count = await seed_members_from_api(context.bot, chat_id)
+            total = len(get_members(chat_id))
+
+            try:
+                member_count = await context.bot.get_chat_member_count(chat_id)
+            except Exception:
+                member_count = "?"
+
+            await query.edit_message_text(
+                f"✅ *Quét xong — {new_title}*\n\n"
+                f"👥 Tổng thành viên trong nhóm: *{member_count}*\n"
+                f"💾 Đã lưu trong DB: *{total}*\n"
+                f"🔑 Admin đã cập nhật: *{admin_count}*\n\n"
+                f"⚠️ Telegram chỉ cho phép lấy danh sách admin. "
+                f"Thành viên thường sẽ được ghi nhận dần khi nhắn tin.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩ Quét lại", callback_data=f"grp:scan:{chat_id}"),
+                    InlineKeyboardButton("🏠 Menu",      callback_data="adm:menu"),
+                ]])
+            )
+
         elif action == "reset":
             await query.edit_message_text(
                 f"🔄 Xác nhận reset *toàn bộ điểm* của nhóm *{title}*?",
@@ -901,6 +975,7 @@ async def post_init(app):
         BotCommand("roll",      "Tung xúc xắc: /roll [max]"),
         BotCommand("guess",     "Bắt đầu đoán số (admin)"),
         BotCommand("stopguess", "Dừng đoán số"),
+        BotCommand("scan",      "Quét thành viên nhóm (admin)"),
         BotCommand("raffle",    "Tạo bốc thăm: /raffle <giải>"),
         BotCommand("join",      "Tham gia bốc thăm"),
         BotCommand("draw",      "Quay số bốc thăm"),
@@ -952,6 +1027,7 @@ def run_bot():
     app.add_handler(CommandHandler("roll",      cmd_roll))
     app.add_handler(CommandHandler("guess",     cmd_guess))
     app.add_handler(CommandHandler("stopguess", cmd_stopguess))
+    app.add_handler(CommandHandler("scan",      cmd_scan))
     app.add_handler(CommandHandler("raffle",    cmd_raffle))
     app.add_handler(CommandHandler("join",      cmd_join))
     app.add_handler(CommandHandler("draw",      cmd_draw))
