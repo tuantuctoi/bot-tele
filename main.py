@@ -200,7 +200,11 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         diff = abs(guess - target)
-        hint = "Lớn hơn" if guess < target else "Nhỏ hơn"
+        if guess < target:
+            direction = f"🔼 Số bí mật nằm *trên* {guess}"
+        else:
+            direction = f"🔽 Số bí mật nằm *dưới* {guess}"
+
         if diff <= 5:
             temp = "🔥🔥🔥 Cực kỳ gần!"
         elif diff <= 15:
@@ -209,7 +213,7 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temp = "🌡️ Gần rồi!"
         else:
             temp = "❄️ Lạnh!"
-        await update.message.reply_text(f"{temp} {hint}")
+        await update.message.reply_text(f"{direction}\n{temp}", parse_mode="Markdown")
 
 
 # =========================
