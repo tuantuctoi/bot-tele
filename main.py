@@ -9,10 +9,13 @@ import logging
 from contextlib import contextmanager
 
 from flask import Flask
-from telegram import Update, BotCommand, ChatMember
+from telegram import (
+    Update, BotCommand, BotCommandScopeDefault,
+    BotCommandScopeAllGroupChats, ChatMember,
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters,
+    ChatMemberHandler, ContextTypes, filters,
 )
 
 # =========================
@@ -213,11 +216,50 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # COMMANDS
 # =========================
 
+async def seed_members_from_api(bot, chat_id: int):
+    """Fetch admins from Telegram API and seed into DB."""
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for cm in admins:
+            u = cm.user
+            if not u.is_bot:
+                upsert_member(chat_id, u.id, u.username or "", u.full_name)
+        logging.info("Seeded %d admins for chat %s", len(admins), chat_id)
+    except Exception:
+        logging.exception("seed_members_from_api failed | chat_id=%s", chat_id)
+
+
+async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track members joining/leaving via ChatMemberUpdated events."""
+    result = update.chat_member or update.my_chat_member
+    if not result:
+        return
+
+    chat = result.chat
+    new = result.new_chat_member
+    u = new.user
+
+    if u.is_bot:
+        # Bot itself was added to a group — seed admins
+        if new.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+            await seed_members_from_api(context.bot, chat.id)
+        return
+
+    if new.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+        upsert_member(chat.id, u.id, u.username or "", u.full_name)
+        logging.info("Member joined | chat=%s | user=%s", chat.id, u.id)
+    elif new.status in (ChatMember.LEFT, ChatMember.BANNED):
+        logging.info("Member left | chat=%s | user=%s", chat.id, u.id)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     if user:
         upsert_member(chat.id, user.id, user.username or "", user.full_name)
+    # Auto-seed admins when /start is called in a group
+    if only_group(chat):
+        await seed_members_from_api(context.bot, chat.id)
     await update.message.reply_text(
         "🤖 *Bot Nhóm*\n\n"
         "📋 Danh sách lệnh:\n"
@@ -524,7 +566,7 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def post_init(app):
-    await app.bot.set_my_commands([
+    commands = [
         BotCommand("start",     "Hiển thị menu"),
         BotCommand("random",    "Chọn ngẫu nhiên thành viên"),
         BotCommand("roll",      "Tung xúc xắc: /roll [max]"),
@@ -537,8 +579,12 @@ async def post_init(app):
         BotCommand("top",       "Bảng xếp hạng điểm"),
         BotCommand("points",    "Xem điểm của bạn"),
         BotCommand("gift",      "Tặng điểm: /gift @user <điểm>"),
-    ])
-    logging.info("Bot commands registered")
+    ]
+    # Default scope (private chat)
+    await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    # Group scope — shows autocomplete when typing / in groups
+    await app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    logging.info("Bot commands registered for default + group scopes")
 
 
 # =========================
@@ -575,8 +621,15 @@ def run_bot():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message))
 
+    # Track member join/leave and bot being added to groups
+    app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
     logging.info("Bot started with polling...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "chat_member", "my_chat_member"],
+    )
 
 
 if __name__ == "__main__":
